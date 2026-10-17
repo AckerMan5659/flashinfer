@@ -500,7 +500,7 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        (1, 1536, 1024),
+        (64, 1536, 1024),  # M > 32: the SM107 kernel is the untuned default
         (100, 4096, 1024),  # M % 8 != 0
         (256, 1536, 6144),
         (4096, 6144, 1536),
@@ -509,7 +509,7 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
     ],
 )
 def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
-    """On SM107, mm_mxfp8(backend="cute-dsl") runs the SM107 kernel and is correct."""
+    """On SM107, mm_mxfp8(backend="cute-dsl") runs the SM107 kernel above M=32 and is correct."""
     _skip_if_unsupported("cute-dsl")
     from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
 
@@ -581,6 +581,80 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         out.zero_()
         runner(inputs, tactic=tactic)
         _assert_cosine_similarity(reference, out)
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize(
+    "m,n,k,first_runner,split_k",
+    [
+        (1, 1536, 1024, "CuteDSLMxfp8WarpSplitKRunner", None),
+        (4, 6144, 1536, "CuteDSLMxfp8WarpSplitKRunner", None),
+        (4, 6144, 4096, "CuteDSLMxfp8GemmRunner", 4),
+        (16, 6144, 1536, "CuteDSLMxfp8GemmRunner", 1),
+        (16, 6144, 6144, "CuteDSLMxfp8GemmRunner", 4),
+        (16, 12288, 6144, "CuteDSLMxfp8GemmRunner", 2),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_sm107_small_m(m, n, k, first_runner, split_k, monkeypatch):
+    """On SM107 at M <= 32 the small-M runners are registered and the untuned pick is the expected one."""
+    _skip_if_unsupported("cute-dsl")
+    from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
+    from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+    from flashinfer.utils import get_device_sm_count
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip(
+            "The SM107 cute-dsl mm_mxfp8 path requires CuTe DSL >= 4.8 "
+            "(cutlass.utils.rubin_helpers)."
+        )
+    if first_runner == "CuteDSLMxfp8WarpSplitKRunner" and (
+        not is_cute_dsl_experimental_available()
+    ):
+        pytest.skip("The warp split-K mm_mxfp8 kernel needs the experimental CuTe DSL.")
+    if split_k is not None and split_k > 1:
+        sm_count = get_device_sm_count(torch.device("cuda"))
+        if sm_count < (n // 128) * split_k:
+            pytest.skip(
+                f"{split_k} slices of N={n} do not fit one wave on {sm_count} SMs"
+            )
+
+    runner_sets = []
+    make_runners = gemm_base._cute_dsl_mxfp8_runners_sm107  # pyright: ignore[reportPrivateUsage]
+
+    def recording_runners(*args, **kwargs):
+        runners = make_runners(*args, **kwargs)
+        runner_sets.append(runners)
+        return runners
+
+    splits = []
+    pick_split = gemm_base._sm107_low_m_split_k  # pyright: ignore[reportPrivateUsage]
+
+    def recording_split(*args, **kwargs):
+        slices = pick_split(*args, **kwargs)
+        splits.append(slices)
+        return slices
+
+    monkeypatch.setattr(gemm_base, "_cute_dsl_mxfp8_runners_sm107", recording_runners)
+    monkeypatch.setattr(gemm_base, "_sm107_low_m_split_k", recording_split)
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=False,
+        provide_out=True,
+    )
+    assert runner_sets, "mm_mxfp8 did not build the SM107 runner set"
+    names = [type(r).__name__ for r in runner_sets[-1]]
+    assert "CuteDSLMxfp8Sm107GemmRunner" in names, names
+    assert "CuteDSLMxfp8GemmRunner" in names, names
+    assert names[0] == first_runner, names
+    if split_k is None:
+        assert splits == [], splits
+    else:
+        assert splits and all(s == split_k for s in splits), splits
 
 
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
